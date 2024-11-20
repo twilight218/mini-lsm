@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Ok, Result};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -17,7 +17,7 @@ use crate::compact::{
 };
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::MemTable;
+use crate::mem_table::{self, MemTable};
 use crate::mvcc::LsmMvccInner;
 use crate::table::SsTable;
 
@@ -47,7 +47,7 @@ pub enum WriteBatchRecord<T: AsRef<[u8]>> {
 impl LsmStorageState {
     fn create(options: &LsmStorageOptions) -> Self {
         let levels = match &options.compaction_options {
-            CompactionOptions::Leveled(LeveledCompactionOptions { max_levels, .. })
+            CompactionOptions::Leveled(LeveledCompactionOptions { max_levels, .. })  // 提取max_levels字段值，忽略其它字段
             | CompactionOptions::Simple(SimpleLeveledCompactionOptions { max_levels, .. }) => (1
                 ..=*max_levels)
                 .map(|level| (level, Vec::new()))
@@ -279,7 +279,25 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+        let guard = self.state.read();
+        let snapshot = &guard;
+        // 从memtable中获取
+        if let Some(val) = snapshot.memtable.get(_key) {
+            if val.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(val));
+        }
+        // 从immutable memtable中获取,从前往后找，找到了就返回
+        for memtable in snapshot.imm_memtables.iter() {
+            if let Some(val) = memtable.get(_key) {
+                if val.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(val));
+            }
+        }
+        Ok(None)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -289,12 +307,42 @@ impl LsmStorageInner {
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+        assert!(!_value.is_empty(), "value cannot be empty");
+        assert!(!_key.is_empty(), "key cannot be empty");
+        let size;
+        {
+            let guard = self.state.read();
+            guard.memtable.put(_key, _value)?;
+            size = guard.memtable.approximate_size();
+        }
+        self.try_freeze(size)?;
+        Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        unimplemented!()
+        assert!(!_key.is_empty(), "key cannot be empty");
+        let size;
+        {
+            let guard = self.state.read();
+            guard.memtable.put(_key, b"")?;
+            size = guard.memtable.approximate_size();
+        }
+        self.try_freeze(size)?;
+        Ok(())
+    }
+
+    fn try_freeze(&self, estimated_size: usize) -> Result<()> {
+        if estimated_size > self.options.target_sst_size {
+            let state_lock = self.state_lock.lock();
+            let guard = self.state.read();
+            // 拿到互斥锁后再进行size判断，防止多个线程插入key时同时新建memtable
+            if guard.memtable.approximate_size() > self.options.target_sst_size {
+                drop(guard);
+                self.force_freeze_memtable(&state_lock)?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -319,7 +367,20 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+        let next_mem_id = self.next_sst_id();
+        let new_memtable = Arc::new(MemTable::create(next_mem_id));
+        let old_memtable;
+        {
+            let mut guard = self.state.write();
+            let mut snapshot = guard.as_ref().clone();
+            // 用new_memtable代替原来的，并返回原来的memtable
+            old_memtable = std::mem::replace(&mut snapshot.memtable, new_memtable);
+            // 旧memtable插入到头部
+            snapshot.imm_memtables.insert(0, old_memtable.clone());
+            // snapshot更新
+            *guard = Arc::new(snapshot);
+        }
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk
